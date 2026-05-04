@@ -27,10 +27,18 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         allow_install_missing: bool,
     },
+    PromptInstallCli {
+        #[arg(long)]
+        cli_path: Option<PathBuf>,
+        #[arg(long)]
+        print_path: bool,
+    },
     Status {
         #[arg(long)]
         json: bool,
     },
+    /// Install the already rebuilt update package, if one is ready.
+    InstallReady,
     /// Install a Debian package (.deb) with elevated privileges.
     InstallDeb {
         #[arg(long)]

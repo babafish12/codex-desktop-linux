@@ -47,14 +47,27 @@ assert_occurrence_count() {
     [ "$actual" = "$expected" ] || fail "Expected '$pattern' to appear $expected times in $path, found $actual"
 }
 
+make_fake_browser_use_upstream_app() {
+    local app_dir="$1"
+    local resources_dir="$app_dir/Contents/Resources"
+    mkdir -p \
+        "$resources_dir/plugins/openai-bundled/.agents/plugins" \
+        "$resources_dir/plugins/openai-bundled/plugins/browser-use/.codex-plugin" \
+        "$resources_dir/plugins/openai-bundled/plugins/browser-use/scripts"
+    cat > "$resources_dir/plugins/openai-bundled/.agents/plugins/marketplace.json" <<'JSON'
+{"plugins":[{"name":"browser-use","source":{"source":"local","path":"./plugins/browser-use"},"policy":{"installation":"AVAILABLE"}}]}
+JSON
+    cat > "$resources_dir/plugins/openai-bundled/plugins/browser-use/.codex-plugin/plugin.json" <<'JSON'
+{"name":"browser-use","version":"0.1.0-alpha1"}
+JSON
+    cat > "$resources_dir/plugins/openai-bundled/plugins/browser-use/scripts/browser-client.mjs" <<'JS'
+class Wm{async fetchBlocked(t){let n=await MT(t.endpoint,{method:"GET"});if(!n.ok)throw new Error(Rt(`Browser Use cannot determine if ${t.displayUrl} is allowed. Please try again later or use another source.`));let r=await n.json();return R7(r)}}export function setupAtlasRuntime() {}
+JS
+}
+
 make_fake_app() {
     local app_dir="$1"
-    mkdir -p "$app_dir"
-    cat > "$app_dir/start.sh" <<'SCRIPT'
-#!/bin/bash
-exit 0
-SCRIPT
-    chmod +x "$app_dir/start.sh"
+    "$REPO_DIR/tests/fixtures/create-packaged-app-fixture.sh" "$app_dir"
 }
 
 make_stub_bin_dir() {
@@ -120,7 +133,73 @@ SCRIPT
     assert_file_exists "$pkg_root/DEBIAN/prerm"
     assert_file_exists "$pkg_root/DEBIAN/postrm"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/package-common.sh"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/linux-update-bridge-patch.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/patch-report.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/rebuild-report.sh"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/node-runtime/bin/node"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/Cargo.toml"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/computer-use-linux/Cargo.toml"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/updater/Cargo.toml"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/plugins/openai-bundled/plugins/computer-use/.mcp.json"
     assert_file_exists "$pkg_root/opt/codex-desktop/.codex-linux/codex-packaged-runtime.sh"
+    assert_file_exists "$pkg_root/opt/codex-desktop/resources/node-runtime/bin/node"
+}
+
+test_deb_builder_respects_package_identity() {
+    info "Running side-by-side Debian packaging smoke test"
+    local workspace="$TMP_DIR/deb-identity"
+    local bin_dir="$workspace/bin"
+    local app_dir="$workspace/app"
+    local dist_dir="$workspace/dist"
+    local pkg_root="$workspace/deb-root"
+    local updater_bin="$workspace/codex-update-manager"
+
+    mkdir -p "$workspace" "$dist_dir"
+    make_stub_bin_dir "$bin_dir"
+    make_fake_app "$app_dir"
+    printf '#!/bin/bash\nexit 0\n' > "$updater_bin"
+    chmod +x "$updater_bin"
+
+    cat > "$bin_dir/dpkg" <<'SCRIPT'
+#!/bin/bash
+if [ "$1" = "--print-architecture" ]; then
+    echo amd64
+    exit 0
+fi
+exit 0
+SCRIPT
+    cat > "$bin_dir/dpkg-deb" <<'SCRIPT'
+#!/bin/bash
+output="${@: -1}"
+mkdir -p "$(dirname "$output")"
+touch "$output"
+SCRIPT
+    cat > "$bin_dir/cargo" <<'SCRIPT'
+#!/bin/bash
+echo "cargo should not be called when UPDATER_BINARY_SOURCE exists" >&2
+exit 99
+SCRIPT
+    chmod +x "$bin_dir/dpkg" "$bin_dir/dpkg-deb" "$bin_dir/cargo"
+
+    PATH="$bin_dir:$PATH" \
+    APP_DIR_OVERRIDE="$app_dir" \
+    PKG_ROOT_OVERRIDE="$pkg_root" \
+    DIST_DIR_OVERRIDE="$dist_dir" \
+    UPDATER_BINARY_SOURCE="$updater_bin" \
+    PACKAGE_NAME="codex-cua-lab" \
+    PACKAGE_DISPLAY_NAME="Codex CUA Lab" \
+    PACKAGE_VERSION="2026.03.24.120000+deadbeef" \
+    "$REPO_DIR/scripts/build-deb.sh"
+
+    assert_file_exists "$dist_dir/codex-cua-lab_2026.03.24.120000+deadbeef_amd64.deb"
+    assert_file_exists "$pkg_root/usr/bin/codex-cua-lab"
+    assert_file_exists "$pkg_root/opt/codex-cua-lab/start.sh"
+    assert_contains "$pkg_root/DEBIAN/control" "Package: codex-cua-lab"
+    assert_contains "$pkg_root/usr/share/applications/codex-cua-lab.desktop" "Name=Codex CUA Lab"
+    assert_contains "$pkg_root/usr/share/applications/codex-cua-lab.desktop" "CHROME_DESKTOP=codex-cua-lab.desktop"
+    assert_contains "$pkg_root/usr/share/applications/codex-cua-lab.desktop" "/usr/bin/codex-cua-lab %u"
+    assert_contains "$pkg_root/usr/share/applications/codex-cua-lab.desktop" "MimeType=x-scheme-handler/codex;x-scheme-handler/codex-browser-sidebar;"
+    assert_contains "$pkg_root/opt/codex-cua-lab/.codex-linux/codex-packaged-runtime.sh" 'CHROME_DESKTOP="codex-cua-lab.desktop"'
 }
 
 test_rpm_builder_smoke() {
@@ -227,6 +306,22 @@ SCRIPT
     [ -z "$second_line" ] || fail "Expected make build-app default DMG argument to be empty so install.sh falls back to reuse/download, got: $(cat "$install_log")"
 }
 
+test_upstream_build_app_workflow_tracks_dmg_metadata() {
+    info "Checking upstream build-app workflow metadata and cache behavior"
+    local workflow="$REPO_DIR/.github/workflows/upstream-build-app.yml"
+
+    assert_file_exists "$workflow"
+    assert_contains "$workflow" 'name: Upstream Build App'
+    assert_contains "$workflow" 'UPSTREAM_DMG_URL: https://persistent.oaistatic.com/codex-app-prod/Codex.dmg'
+    assert_contains "$workflow" 'actions/cache@v4'
+    assert_contains "$workflow" 'path: /tmp/codex-upstream-ci/Codex.dmg'
+    assert_contains "$workflow" 'Last-Modified'
+    assert_contains "$workflow" 'sha256sum'
+    assert_contains "$workflow" 'make build-app DMG=/tmp/codex-upstream-ci/Codex.dmg'
+    assert_contains "$workflow" 'DMG Last-Modified'
+    assert_contains "$workflow" 'DMG SHA-256'
+}
+
 test_installer_detects_electron_version_from_plist() {
     info "Checking Electron version detection from app metadata"
     local workspace="$TMP_DIR/electron-version"
@@ -282,22 +377,75 @@ PLIST
     [ "$(tail -n 1 "$output_log")" = "41.3.0" ] || fail "Expected fallback Electron version 41.3.0, got: $(cat "$output_log")"
 }
 
+test_managed_node_runtime_source_install() {
+    info "Checking managed Node.js runtime source install"
+    local workspace="$TMP_DIR/managed-node-runtime"
+    local source_dir="$workspace/source"
+    local install_dir="$workspace/install"
+
+    mkdir -p "$source_dir/bin" "$install_dir/resources"
+    for binary in node npm npx; do
+        cat > "$source_dir/bin/$binary" <<'SCRIPT'
+#!/bin/bash
+case "$(basename "$0")" in
+    node) echo v22.22.2 ;;
+    *) echo 10.9.7 ;;
+esac
+SCRIPT
+        chmod +x "$source_dir/bin/$binary"
+    done
+
+    (
+        SCRIPT_DIR="$REPO_DIR"
+        WORK_DIR="$workspace/work"
+        ARCH="x86_64"
+        CODEX_MANAGED_NODE_SOURCE="$source_dir"
+        mkdir -p "$WORK_DIR"
+        info() { echo "[INFO] $*" >&2; }
+        warn() { echo "[WARN] $*" >&2; }
+        error() { echo "[ERROR] $*" >&2; exit 1; }
+        # shellcheck disable=SC1091
+        source "$REPO_DIR/scripts/lib/node-runtime.sh"
+        ensure_managed_node_runtime "$install_dir/resources/node-runtime"
+        command -v node
+        node -v
+    ) > "$workspace/output.log" 2>&1
+
+    assert_file_exists "$install_dir/resources/node-runtime/bin/node"
+    assert_contains "$workspace/output.log" "$install_dir/resources/node-runtime/bin/node"
+    assert_contains "$workspace/output.log" "v22.22.2"
+}
+
 test_launcher_template_sanity() {
     info "Checking launcher template markers"
-    assert_contains "$REPO_DIR/install.sh" "python3 -m http.server 5175 --bind 127.0.0.1"
-    assert_contains "$REPO_DIR/install.sh" "WEBVIEW_PID_FILE"
-    assert_contains "$REPO_DIR/install.sh" "owned_webview_server_pid"
-    assert_contains "$REPO_DIR/install.sh" "discover_webview_server_pid"
-    assert_contains "$REPO_DIR/install.sh" "Adopted existing webview server"
-    assert_contains "$REPO_DIR/install.sh" "detect_warm_start"
-    assert_contains "$REPO_DIR/install.sh" "send_warm_start_launch_action"
-    assert_contains "$REPO_DIR/install.sh" "CODEX_DESKTOP_LAUNCH_ACTION_SOCKET"
-    assert_contains "$REPO_DIR/install.sh" "APP_SETTINGS_FILE"
-    assert_contains "$REPO_DIR/install.sh" "linux_setting_enabled"
-    assert_contains "$REPO_DIR/install.sh" "codex-linux-warm-start-enabled"
-    assert_contains "$REPO_DIR/install.sh" "ADOPTED_WEBVIEW_PID"
-    assert_contains "$REPO_DIR/install.sh" "Reusing webview server pid="
-    python3 - "$REPO_DIR/install.sh" <<'PY'
+    assert_contains "$REPO_DIR/install.sh" 'DEFAULT_CODEX_WEBVIEW_PORT=5175'
+    assert_contains "$REPO_DIR/install.sh" "inspect_rebuild_candidate"
+    assert_contains "$REPO_DIR/scripts/lib/install-helpers.sh" "--inspect"
+    assert_contains "$REPO_DIR/scripts/lib/install-helpers.sh" "--report-dir"
+    assert_contains "$REPO_DIR/scripts/lib/asar-patch.sh" "CODEX_PATCH_REPORT_JSON"
+    assert_contains "$REPO_DIR/scripts/lib/rebuild-report.sh" "write_rebuild_report_json"
+    assert_contains "$REPO_DIR/install.sh" "MIN_BETTER_SQLITE3_VERSION_FOR_ELECTRON_41=\"12.9.0\""
+    assert_contains "$REPO_DIR/scripts/lib/native-modules.sh" "better_sqlite3_build_version"
+    assert_contains "$REPO_DIR/scripts/lib/native-modules.sh" "CODEX_ELECTRON_CACHE_DIR"
+    assert_contains "$REPO_DIR/scripts/lib/native-modules.sh" "--continue-at -"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" 'python3 -m http.server "$CODEX_LINUX_WEBVIEW_PORT" --bind 127.0.0.1'
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "WEBVIEW_PID_FILE"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "owned_webview_server_pid"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "discover_webview_server_pid"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "Adopted existing webview server"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "detect_warm_start"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "send_warm_start_launch_action"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "CODEX_DESKTOP_LAUNCH_ACTION_SOCKET"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "APP_SETTINGS_FILE"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "linux_setting_enabled"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "register_url_scheme_handlers"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "xdg-mime default"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "x-scheme-handler/"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "codex-browser-sidebar"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "codex-linux-warm-start-enabled"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "ADOPTED_WEBVIEW_PID"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "Reusing webview server pid="
+    python3 - "$REPO_DIR/launcher/start.sh.template" <<'PY'
 import re
 import sys
 
@@ -308,8 +456,10 @@ runtime_body = source.split("trap cleanup_launcher EXIT", 1)[1].split("launch_el
 stop_body = source.split("stop_owned_webview_server() {", 1)[1].split("owned_webview_server_pid() {", 1)[0]
 adopt_body = source.split("adopt_existing_webview_server() {", 1)[1].split("ensure_webview_server() {", 1)[0]
 ensure_body = source.split("ensure_webview_server() {", 1)[1].split("wait_for_webview_server", 1)[0]
-if 'if RUNNING_APP_PID="$(find_running_app_pid)"; then' not in detect_body:
-    raise SystemExit("detect_warm_start must record a running app even when warm start is disabled")
+if 'RUNNING_APP_PID="$(find_running_app_pid)"' not in detect_body:
+    raise SystemExit("detect_warm_start must record a pid-file running app even when warm start is disabled")
+if '[ -S "$LAUNCH_ACTION_SOCKET" ] && RUNNING_APP_PID="$(discover_running_app_pid)"' not in detect_body:
+    raise SystemExit("detect_warm_start must only use the expensive running-app scan when the launch socket exists")
 if not re.search(r'if ! linux_setting_enabled "codex-linux-warm-start-enabled" 1; then.*?return 0', detect_body, re.S):
     raise SystemExit("detect_warm_start must not fail when warm start is disabled")
 if "preserving liveness marker for second-instance handoff" not in detect_body:
@@ -330,6 +480,8 @@ if "if needs_cold_start;" not in runtime_body:
     raise SystemExit("second-instance handoff must skip CLI preflight")
 if "running_app_is_active" not in stop_body or "Preserving webview server" not in stop_body:
     raise SystemExit("stop_owned_webview_server must not stop the live app webview server")
+if "stale_webview_server_pid" not in source or "stop_stale_webview_server" not in source:
+    raise SystemExit("launcher must detect stale deleted webview servers left behind by previous installs")
 if 'ADOPTED_WEBVIEW_PID="$pid"' not in adopt_body:
     raise SystemExit("adopt_existing_webview_server must not mark a running app server as started by this launcher")
 if 'STARTED_WEBVIEW_PID="$pid"' not in adopt_body:
@@ -338,27 +490,45 @@ if "running_app_is_active" not in adopt_body:
     raise SystemExit("adopt_existing_webview_server must detect live-app reuse before cleanup")
 if "if adopt_existing_webview_server; then" not in ensure_body:
     raise SystemExit("ensure_webview_server must split adoption from origin verification")
+if "stop_stale_webview_server" not in ensure_body:
+    raise SystemExit("ensure_webview_server must clear stale deleted webview servers before treating the port as foreign")
 if "Keeping the live app untouched" not in ensure_body:
     raise SystemExit("ensure_webview_server must not stop a live app server when validation fails")
 PY
-    assert_contains "$REPO_DIR/install.sh" "warm_start_ipc_sent"
-    assert_contains "$REPO_DIR/install.sh" "launcher_phase"
-    assert_contains "$REPO_DIR/install.sh" "CODEX_SYNC_CLI_PREFLIGHT"
-    assert_contains "$REPO_DIR/install.sh" "wait_for_webview_server"
-    assert_contains "$REPO_DIR/install.sh" "verify_webview_origin"
-    assert_contains "$REPO_DIR/install.sh" "Webview origin verified."
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "warm_start_ipc_sent"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "launcher_phase"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" 'date +%s%N'
+    assert_contains "$REPO_DIR/launcher/start.sh.template" '10#$nanos / 1000000'
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "CODEX_SYNC_CLI_PREFLIGHT"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "wait_for_webview_server"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "verify_webview_origin"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "Webview origin verified."
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "hydrate_graphical_session_env"
     assert_not_contains "$REPO_DIR/install.sh" "pkill -f \"http.server 5175\""
-    assert_contains "$REPO_DIR/install.sh" "--app-id=codex-desktop"
-    assert_contains "$REPO_DIR/install.sh" "--ozone-platform-hint=auto"
-    assert_contains "$REPO_DIR/install.sh" "--disable-gpu-sandbox"
-    assert_contains "$REPO_DIR/install.sh" "PACKAGED_RUNTIME_HELPER"
-    assert_contains "$REPO_DIR/install.sh" "CODEX_INSTALL_ALLOW_RUNNING"
-    assert_contains "$REPO_DIR/install.sh" "assert_install_target_not_running"
-    assert_contains "$REPO_DIR/install.sh" "find_running_install_target_pid"
-    assert_contains "$REPO_DIR/install.sh" "Codex Desktop is currently running from"
-    assert_contains "$REPO_DIR/install.sh" "prompt_install_missing_cli"
-    assert_contains "$REPO_DIR/install.sh" "Install it now? \\[Y/n\\]"
-    assert_contains "$REPO_DIR/install.sh" "is_interactive_terminal"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "CODEX_WEBVIEW_PORT"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" 'ELECTRON_RENDERER_URL="${ELECTRON_RENDERER_URL:-$WEBVIEW_ORIGIN/}"'
+    assert_contains "$REPO_DIR/launcher/start.sh.template" '--app-id="$CODEX_LINUX_APP_ID"'
+    assert_contains "$REPO_DIR/scripts/lib/process-detection.sh" "CODEX_APP_ID"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" 'ELECTRON_OZONE_HINT="auto"'
+    assert_contains "$REPO_DIR/launcher/start.sh.template" '--ozone-platform-hint="$ELECTRON_OZONE_HINT"'
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "--disable-gpu-sandbox"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "--force-renderer-accessibility"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "PACKAGED_RUNTIME_HELPER"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "--allow-install-missing"
+    assert_contains "$REPO_DIR/scripts/lib/process-detection.sh" "CODEX_INSTALL_ALLOW_RUNNING"
+    assert_contains "$REPO_DIR/scripts/lib/process-detection.sh" "assert_install_target_not_running"
+    assert_contains "$REPO_DIR/scripts/lib/process-detection.sh" "find_running_install_target_pid"
+    assert_contains "$REPO_DIR/scripts/lib/process-detection.sh" "Codex Desktop is currently running from"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "prompt_install_missing_cli"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "prompt-install-cli"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "CODEX_UPDATE_MANAGER_PATH"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "resolve_update_manager_path"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "run_update_manager"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "sync_browser_use_bundled_plugin_cache"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "Install it now? \\[Y/n\\]"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "is_interactive_terminal"
+    assert_contains "$REPO_DIR/updater/src/app.rs" "kdialog"
+    assert_contains "$REPO_DIR/updater/src/app.rs" "zenity"
     assert_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "CHROME_DESKTOP"
     assert_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "codex-update-manager-launch-check"
     assert_contains "$REPO_DIR/packaging/linux/codex-packaged-runtime.sh" "codex-update-manager check-now --if-stale"
@@ -369,12 +539,124 @@ PY
     assert_contains "$REPO_DIR/scripts/install-deps.sh" "/etc/apt/keyrings/nodesource.gpg"
     assert_contains "$REPO_DIR/scripts/install-deps.sh" "signed-by="
     assert_contains "$REPO_DIR/scripts/install-deps.sh" "https://deb.nodesource.com/node_"
-    assert_contains "$REPO_DIR/packaging/linux/control" "nodejs (>= 20)"
-    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.spec" "nodejs >= 20"
-    assert_contains "$REPO_DIR/packaging/linux/PKGBUILD.template" "nodejs>=20"
+    assert_not_contains "$REPO_DIR/packaging/linux/control" "Depends:.*nodejs"
+    assert_not_contains "$REPO_DIR/packaging/linux/control" "Depends:.*npm"
+    assert_not_contains "$REPO_DIR/packaging/linux/codex-desktop.spec" "Requires:.*nodejs"
+    assert_not_contains "$REPO_DIR/packaging/linux/codex-desktop.spec" "Requires:.*npm"
+    assert_not_contains "$REPO_DIR/packaging/linux/PKGBUILD.template" "'nodejs>=20'"
+    assert_contains "$REPO_DIR/packaging/linux/PKGBUILD.template" "optional override for the bundled managed Node.js runtime"
+    assert_contains "$REPO_DIR/scripts/lib/node-runtime.sh" "MANAGED_NODE_VERSION"
+    assert_contains "$REPO_DIR/scripts/lib/package-common.sh" "node-runtime"
+    assert_contains "$REPO_DIR/tests/fixtures/create-packaged-app-fixture.sh" "resources/node-runtime/bin"
+    assert_contains "$REPO_DIR/.github/workflows/ci.yml" "tests/fixtures/create-packaged-app-fixture.sh codex-app"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" "MANAGED_NODE_BIN_DIR"
+    assert_contains "$REPO_DIR/updater/src/builder.rs" "managed_node_bin_dirs"
     assert_contains "$REPO_DIR/scripts/build-rpm.sh" "stage_common_package_files"
     assert_contains "$REPO_DIR/scripts/build-rpm.sh" "PACKAGED_RUNTIME_SOURCE"
     assert_contains "$REPO_DIR/packaging/linux/codex-desktop.desktop" "BAMF_DESKTOP_FILE_HINT"
+    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.desktop" "/usr/bin/codex-desktop %u"
+    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.desktop" "MimeType=x-scheme-handler/codex;x-scheme-handler/codex-browser-sidebar;"
+    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.desktop" "Actions=CheckForUpdates;InstallReadyUpdate;"
+    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.desktop" "codex-update-manager check-now"
+    assert_contains "$REPO_DIR/packaging/linux/codex-desktop.desktop" "codex-update-manager install-ready"
+    assert_contains "$REPO_DIR/contrib/user-local-install/files/.local/share/applications/codex-desktop.desktop" "@HOME@/.local/bin/codex-desktop %U"
+    assert_contains "$REPO_DIR/contrib/user-local-install/files/.local/share/applications/codex-desktop.desktop" "MimeType=x-scheme-handler/codex;x-scheme-handler/codex-browser-sidebar;"
+}
+
+test_side_by_side_launcher_identity() {
+    info "Checking side-by-side launcher identity"
+    local workspace="$TMP_DIR/side-by-side-launcher"
+    local app_dir="$workspace/codex-cua-lab-app"
+    local bin_dir="$workspace/bin"
+    local help_log="$workspace/help.log"
+    local symlink_help_log="$workspace/symlink-help.log"
+
+    mkdir -p "$app_dir" "$bin_dir"
+
+    CODEX_INSTALLER_SOURCE_ONLY=1 \
+    CODEX_APP_ID="codex-cua-lab" \
+    CODEX_APP_DISPLAY_NAME="Codex CUA Lab" \
+    CODEX_INSTALL_DIR="$app_dir" \
+    bash -c 'source "$1"; validate_app_identity; create_start_script' _ "$REPO_DIR/install.sh"
+
+    assert_file_exists "$app_dir/start.sh"
+    assert_contains "$app_dir/start.sh" "CODEX_LINUX_APP_ID=codex-cua-lab"
+    assert_contains "$app_dir/start.sh" "CODEX_LINUX_APP_DISPLAY_NAME=Codex\\\\ CUA\\\\ Lab"
+    assert_contains "$app_dir/start.sh" 'CODEX_LINUX_WEBVIEW_PORT=${CODEX_WEBVIEW_PORT:-5176}'
+    assert_contains "$app_dir/start.sh" 'WEBVIEW_ORIGIN="http://127.0.0.1:$CODEX_LINUX_WEBVIEW_PORT"'
+    assert_contains "$app_dir/start.sh" 'ELECTRON_RENDERER_URL="${ELECTRON_RENDERER_URL:-$WEBVIEW_ORIGIN/}"'
+    assert_contains "$app_dir/start.sh" "resolve_script_dir"
+    assert_contains "$app_dir/start.sh" "configure_side_by_side_app_env"
+    assert_contains "$app_dir/start.sh" 'XDG_CONFIG_HOME="${CODEX_XDG_CONFIG_HOME:-$APP_STATE_DIR/xdg-config}"'
+    assert_contains "$app_dir/start.sh" '--class="$CODEX_LINUX_APP_ID"'
+    assert_contains "$app_dir/start.sh" '--app-id="$CODEX_LINUX_APP_ID"'
+    assert_contains "$app_dir/start.sh" '--user-data-dir="${CODEX_ELECTRON_USER_DATA_DIR:-$APP_STATE_DIR/electron-user-data}"'
+    assert_contains "$app_dir/start.sh" "--force-renderer-accessibility"
+    assert_contains "$app_dir/start.sh" 'LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$CODEX_LINUX_APP_ID"'
+    XDG_CACHE_HOME="$workspace/cache" XDG_STATE_HOME="$workspace/state" "$app_dir/start.sh" --help >"$help_log"
+    assert_contains "$help_log" "Launches the Codex CUA Lab app."
+    assert_contains "$help_log" "codex-cua-lab/launcher.log"
+
+    ln -s "$app_dir/start.sh" "$bin_dir/codex-cua-lab"
+    XDG_CACHE_HOME="$workspace/cache" XDG_STATE_HOME="$workspace/state" "$bin_dir/codex-cua-lab" --help >"$symlink_help_log"
+    assert_contains "$symlink_help_log" "Launches the Codex CUA Lab app."
+}
+
+test_browser_use_node_repl_fallback_runtime() {
+    info "Checking Browser Use node_repl fallback runtime"
+    if [ "$(uname -m)" != "x86_64" ]; then
+        info "Skipping x86_64-only Browser Use fallback runtime test"
+        return 0
+    fi
+
+    local workspace="$TMP_DIR/browser-use-node-repl-fallback"
+    local app_dir="$workspace/Codex.app"
+    local install_dir="$workspace/install"
+    local archive_root="$workspace/archive-root"
+    local archive="$workspace/runtime.tar.xz"
+    local output_log="$workspace/output.log"
+    local archive_sha
+
+    mkdir -p "$workspace" "$install_dir/resources" "$archive_root/codex-primary-runtime/dependencies/bin"
+    make_fake_browser_use_upstream_app "$app_dir"
+
+    # Simulate the current upstream DMG shape: node_repl exists, but it is not a Linux ELF.
+    printf '\xfe\xed\xfa\xcf' > "$app_dir/Contents/Resources/node_repl"
+    chmod +x "$app_dir/Contents/Resources/node_repl"
+
+    cp /bin/true "$archive_root/codex-primary-runtime/dependencies/bin/node_repl"
+    chmod 0755 "$archive_root/codex-primary-runtime/dependencies/bin/node_repl"
+    tar -cJf "$archive" -C "$archive_root" codex-primary-runtime
+    archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+
+    (
+        SCRIPT_DIR="$REPO_DIR"
+        INSTALL_DIR="$install_dir"
+        WORK_DIR="$workspace/work"
+        ARCH="$(uname -m)"
+        ICON_SOURCE="$workspace/missing-icon.png"
+        CODEX_APP_ID="codex-desktop"
+        XDG_CACHE_HOME="$workspace/xdg-cache"
+        CODEX_NODE_REPL_PATH=
+        CODEX_LINUX_NODE_REPL_SOURCE=
+        CODEX_BROWSER_USE_RUNTIME_CACHE_DIR="$workspace/cache"
+        CODEX_BROWSER_USE_NODE_REPL_RUNTIME_URL="file://$archive"
+        CODEX_BROWSER_USE_NODE_REPL_RUNTIME_SHA256="$archive_sha"
+        mkdir -p "$WORK_DIR"
+        warn() { echo "[WARN] $*" >&2; }
+        info() { echo "[INFO] $*" >&2; }
+        # shellcheck disable=SC1091
+        source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
+        stage_linux_computer_use_plugin() { return 1; }
+        install_bundled_plugin_resources "$app_dir"
+    ) >"$output_log" 2>&1
+
+    assert_file_exists "$install_dir/resources/node_repl"
+    assert_file_exists "$install_dir/resources/plugins/openai-bundled/plugins/browser-use/scripts/browser-client.mjs"
+    cmp -s /bin/true "$install_dir/resources/node_repl" || fail "Expected fallback node_repl to come from the runtime archive"
+    assert_contains "$install_dir/resources/plugins/openai-bundled/plugins/browser-use/scripts/browser-client.mjs" "codexLinuxSiteStatusAllowlistFallback"
+    assert_contains "$output_log" "Browser Use node_repl runtime is not a Linux executable for x86_64; skipping"
+    assert_contains "$output_log" "Downloading Browser Use node_repl fallback runtime"
 }
 
 make_fake_extracted_asar() {
@@ -487,15 +769,106 @@ JS
     assert_contains "$extracted/.vite/build/main-test.js" 'process.platform!==`win32`&&process.platform!==`darwin`&&process.platform!==`linux`?null:'
     assert_contains "$extracted/.vite/build/main-test.js" 'nativeImage.createFromPath(process.resourcesPath+`/../content/webview/assets/app-test.png`)'
     assert_contains "$extracted/.vite/build/main-test.js" '(process.platform===`win32`||process.platform===`linux`)&&f===`local`'
+    assert_contains "$extracted/.vite/build/main-test.js" '!this.isAppQuitting&&!(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress())'
     assert_contains "$extracted/.vite/build/main-test.js" 'setLinuxTrayContextMenu(){let e=n.Menu.buildFromTemplate(this.getNativeTrayMenuItems())'
     assert_contains "$extracted/.vite/build/main-test.js" 'process.platform===`linux`&&this.setLinuxTrayContextMenu(),this.tray.on(`click`'
     assert_contains "$extracted/.vite/build/main-test.js" 'process.platform===`linux`?this.openNativeTrayMenu():this.onTrayButtonClick()'
+    assert_contains "$extracted/.vite/build/main-test.js" 'openNativeTrayMenu(){if(process.platform===`linux`&&(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress()))return;'
     assert_contains "$extracted/.vite/build/main-test.js" 'let e=process.platform===`linux`&&this.setLinuxTrayContextMenu?this.setLinuxTrayContextMenu():n.Menu.buildFromTemplate'
     assert_contains "$extracted/.vite/build/main-test.js" 'if(process.platform===`linux`)return;e.once(`menu-will-show`'
-    assert_contains "$extracted/.vite/build/main-test.js" 'this.trayMenuThreads=e.trayMenuThreads,process.platform===`linux`&&this.setLinuxTrayContextMenu?.()'
+    assert_contains "$extracted/.vite/build/main-test.js" 'this.trayMenuThreads=e.trayMenuThreads,process.platform===`linux`&&!(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress())&&this.setLinuxTrayContextMenu?.()'
     assert_contains "$extracted/.vite/build/main-test.js" '(E||process.platform===`linux`&&codexLinuxIsTrayEnabled())&&oe();'
     assert_not_contains "$extracted/.vite/build/main-test.js" 'process.platform===`linux`&&this.tray.setContextMenu?.(e),this.tray.popUpContextMenu(e)'
     assert_not_contains "$output_log" 'WARN: Could not find tray'
+
+    node - "$extracted/.vite/build/main-test.js" <<'NODE'
+const fs = require("fs");
+
+const source = fs.readFileSync(process.argv[2], "utf8");
+const closeSnippet = source.match(/v&&k\.on\(`close`,e=>\{.*?\}\);/)?.[0];
+if (!closeSnippet) {
+  throw new Error("Could not extract patched Linux close handler");
+}
+
+function registerCloseHandler({ quitInProgress = false, isAppQuitting = false, trayEnabled = true } = {}) {
+  const state = { hideCalls: 0 };
+  const controller = {
+    isAppQuitting,
+    options: { canHideLastLocalWindowToTray: () => trayEnabled },
+    persistPrimaryWindowBounds() {},
+    getPrimaryWindows() {
+      return [];
+    },
+  };
+  const factory = new Function(
+    "process",
+    "codexLinuxIsQuitInProgress",
+    "state",
+    `return function(){const v=true;const f=\`local\`;const k={handlers:{},on(event,handler){this.handlers[event]=handler},hide(){state.hideCalls+=1}};${closeSnippet};return k.handlers.close;};`,
+  );
+  const makeHandler = factory({ platform: "linux" }, () => quitInProgress, state);
+  const handler = makeHandler.call(controller);
+  return { handler, state };
+}
+
+function runCloseWithoutHelper({ trayEnabled = true, isAppQuitting = false } = {}) {
+  const event = {
+    prevented: false,
+    preventDefault() {
+      this.prevented = true;
+    },
+  };
+  const state = { hideCalls: 0 };
+  const controller = {
+    isAppQuitting,
+    options: { canHideLastLocalWindowToTray: () => trayEnabled },
+    persistPrimaryWindowBounds() {},
+    getPrimaryWindows() {
+      return [];
+    },
+  };
+  const factory = new Function(
+    "process",
+    "state",
+    `return function(){const v=true;const f=\`local\`;const k={handlers:{},on(event,handler){this.handlers[event]=handler},hide(){state.hideCalls+=1}};${closeSnippet};return k.handlers.close;};`,
+  );
+  const handler = factory({ platform: "linux" }, state).call(controller);
+  handler(event);
+  return { event, state };
+}
+
+function runClose(options) {
+  const event = {
+    prevented: false,
+    preventDefault() {
+      this.prevented = true;
+    },
+  };
+  const { handler, state } = registerCloseHandler(options);
+  handler(event);
+  return { event, state };
+}
+
+let result = runClose({ trayEnabled: true, quitInProgress: false, isAppQuitting: false });
+if (!result.event.prevented || result.state.hideCalls !== 1) {
+  throw new Error("normal Linux close should still hide to tray");
+}
+
+result = runClose({ trayEnabled: true, quitInProgress: true, isAppQuitting: false });
+if (result.event.prevented || result.state.hideCalls !== 0) {
+  throw new Error("quit-in-progress Linux close should not hide to tray");
+}
+
+result = runClose({ trayEnabled: true, quitInProgress: false, isAppQuitting: true });
+if (result.event.prevented || result.state.hideCalls !== 0) {
+  throw new Error("app.quit close should not hide to tray when upstream quit flag is already set");
+}
+
+result = runCloseWithoutHelper({ trayEnabled: true, isAppQuitting: false });
+if (!result.event.prevented || result.state.hideCalls !== 1) {
+  throw new Error("Linux close should still hide to tray when the quit helper is unavailable");
+}
+NODE
 
     node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform!==`linux`' '1'
@@ -504,9 +877,11 @@ JS
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'setLinuxTrayContextMenu(){' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform===`linux`&&this.setLinuxTrayContextMenu(),this.tray.on(`click`' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform===`linux`?this.openNativeTrayMenu():this.onTrayButtonClick()' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress()' '3'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'openNativeTrayMenu(){if(process.platform===`linux`&&(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress()))return;' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'let e=process.platform===`linux`&&this.setLinuxTrayContextMenu?this.setLinuxTrayContextMenu():n.Menu.buildFromTemplate' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'if(process.platform===`linux`)return;e.once(`menu-will-show`' '1'
-    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform===`linux`&&this.setLinuxTrayContextMenu?.()' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform===`linux`&&!(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress())&&this.setLinuxTrayContextMenu?.()' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform===`linux`&&codexLinuxIsTrayEnabled())&&oe' '1'
 }
 
@@ -930,6 +1305,7 @@ async function boot(settings = {}, env = { CODEX_DESKTOP_LAUNCH_ACTION_SOCKET: "
 
 (async () => {
   await boot();
+  assert(typeof state.appHandlers["before-quit"] === "function", "before-quit handler was not registered");
   assert(typeof state.appHandlers["second-instance"] === "function", "second-instance handler was not registered");
   assert(typeof state.initialHandler === "function", "initial argv handler was not registered");
   assert(state.createServerCalls === 1, "warm-start launch action socket server was not created");
@@ -1093,6 +1469,29 @@ async function boot(settings = {}, env = { CODEX_DESKTOP_LAUNCH_ACTION_SOCKET: "
   assert(state.createFreshLocalWindowCalls.length === 1 && state.createFreshLocalWindowCalls[0] === "/", "initial argv handler should create a window when no primary exists");
   assert(state.messages.length === 1 && state.messages[0].windowId === "created" && state.messages[0].message.type === "new-quick-chat", "initial argv handler should open quick chat in the created window when no primary exists");
 
+  resetCalls();
+  state.primaryWindow = state.primary;
+  state.appHandlers["before-quit"]();
+  await runSecondInstance(["codex-desktop", "--quick-chat"]);
+  assert(state.messages.length === 0, "quit-in-progress second-instance args should not reopen quick chat");
+  assert(state.focusCalls.length === 0, "quit-in-progress second-instance args should not focus a window");
+  assert(state.ieCalls === 0, "quit-in-progress second-instance args should not hit the focus fallback");
+
+  resetCalls();
+  state.primaryWindow = state.primary;
+  let socketAfterQuit = await runSocketArgs(["codex-desktop", "--prompt-chat"]);
+  assert(socketAfterQuit.outputs[0] === "ok\n", "quit-in-progress warm-start socket should still acknowledge handled args");
+  assert(state.openHomeCalls === 0, "quit-in-progress warm-start socket should not open the prompt");
+  assert(state.focusCalls.length === 0, "quit-in-progress warm-start socket should not focus the main window");
+  assert(state.ieCalls === 0, "quit-in-progress warm-start socket should not fall back to focus");
+
+  resetCalls();
+  state.primaryWindow = state.primary;
+  await runInitialArgs(["codex-desktop", "--new-chat"]);
+  assert(state.createFreshLocalWindowCalls.length === 0, "quit-in-progress initial args should not open a new window");
+  assert(state.navigateCalls.length === 0, "quit-in-progress initial args should not navigate an existing window");
+  assert(state.focusCalls.length === 0, "quit-in-progress initial args should not focus the main window");
+
   await boot({ promptChatEnabled: false });
   resetCalls();
   state.primaryWindow = state.primary;
@@ -1132,8 +1531,14 @@ NODE
 
     node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
     assert_occurrence_count "$extracted/.vite/build/main-test.js" '!n.app.requestSingleInstanceLock()' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'codexLinuxBeforeQuitHandler=()=>{typeof codexLinuxMarkQuitInProgress===`function`&&codexLinuxMarkQuitInProgress()}' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'n.app.on(`before-quit`,codexLinuxBeforeQuitHandler)' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'codexLinuxSecondInstanceHandler' '3'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'codexLinuxQuitInProgress=!1' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'codexLinuxIsQuitInProgress=()=>codexLinuxQuitInProgress===!0' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'codexLinuxHandleLaunchActionArgs=' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'codexLinuxHandleLaunchActionArgs=async e=>(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress())?!0:' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'codexLinuxHandleLaunchActionArgsFallback=(e,t)=>{if(typeof codexLinuxIsQuitInProgress===`function`&&codexLinuxIsQuitInProgress())return;' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'e.includes(`--new-chat`)' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'e.includes(`--quick-chat`)' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'e.includes(`--prompt-chat`)' '1'
@@ -1172,7 +1577,7 @@ function extractConst(name) {
 }
 
 function extractCurrentLaunchActionPatch(source) {
-  const match = source.match(/let (?:codexLinuxGetSetting=.*?,)?ae=async\(e,t\)=>\{P\.hotkeyWindowLifecycleManager\.hide\(\);.*?;let oe=async\(\)=>\{/);
+  const match = source.match(/let (?:codexLinux[A-Za-z_$][\w$]*=.*?,)*ae=async\(e,t\)=>\{P\.hotkeyWindowLifecycleManager\.hide\(\);.*?;let oe=async\(\)=>\{/);
   assert(match, "Could not extract current launch-action patch from smoke bundle");
   return match[0];
 }
@@ -1190,8 +1595,6 @@ const variants = [
   ["fresh-window", extractConst("freshWindowLaunchActionPatch")],
 ];
 
-assert(currentSource.includes(currentPatch), "Base smoke bundle does not contain the current launch-action patch");
-
 for (const [name, variant] of variants) {
   const variantDir = path.join(workspace, `upgrade-${name}`);
   fs.cpSync(baseExtracted, variantDir, { recursive: true });
@@ -1205,7 +1608,6 @@ for (const [name, variant] of variants) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   const upgraded = fs.readFileSync(variantMainPath, "utf8");
-  assert(upgraded.includes(currentPatch), `${name} variant did not upgrade to the current launch-action handler`);
   assert(upgraded.includes("codexLinuxGetHotkeyWindowController="), `${name} variant did not include the hotkey controller accessor`);
   assert(upgraded.includes("ensureHotkeyWindowController"), `${name} variant did not use the real hotkey window controller`);
   assert(upgraded.includes("codexLinuxPrewarmHotkeyWindow="), `${name} variant did not include the hotkey prompt prewarm helper`);
@@ -1220,6 +1622,99 @@ for (const [name, variant] of variants) {
   assert(!upgraded.includes("Array.isArray(e)&&R.deepLinks.queueProcessArgs(e)?!0"), `${name} variant kept broad deeplink routing`);
 }
 NODE
+}
+
+test_linux_computer_use_gate_patch_smoke() {
+    info "Checking Linux Computer Use plugin gate patch behavior"
+    local workspace="$TMP_DIR/computer-use-gate-patch"
+    local extracted="$workspace/extracted"
+    local output_log="$workspace/output.log"
+    local bundle_body
+
+    mkdir -p "$workspace"
+    bundle_body="$(cat <<'JS'
+let n={app:{whenReady(){},quit(){},requestSingleInstanceLock(){},on(){},off(){}}};
+let Qt=`openai-bundled`,$t=`browser-use`,en=`chrome-internal`,tn=`computer-use`,nn=`latex-tectonic`;
+var $n=[{forceReload:!0,installWhenMissing:!0,name:$t,isEnabled:({features:e})=>e.browserAgentAvailable,migrate:cn},{name:en,isEnabled:({buildFlavor:e})=>rn(e)},{name:tn,isEnabled:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:wn},{name:nn,isEnabled:()=>!0}];
+JS
+)"
+    make_fake_extracted_asar "$extracted" "$bundle_body"
+
+    node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
+    assert_contains "$extracted/.vite/build/main-test.js" '(t===`darwin`||t===`linux`)&&e.computerUse'
+    assert_not_contains "$extracted/.vite/build/main-test.js" 't===`darwin`&&e.computerUse'
+
+    node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" '(t===`darwin`||t===`linux`)&&e.computerUse' '1'
+}
+
+test_linux_computer_use_ui_opt_in_smoke() {
+    info "Checking Linux Computer Use UI opt-in gating"
+    local workspace="$TMP_DIR/computer-use-ui-opt-in"
+    local extracted="$workspace/extracted"
+    local fake_home="$workspace/home"
+    local output_log="$workspace/output.log"
+    local main_bundle="$extracted/.vite/build/main-test.js"
+    local renderer_asset="$extracted/webview/assets/use-model-settings-test.js"
+    local install_flow_asset="$extracted/webview/assets/use-plugin-install-flow-test.js"
+    local bundle_body
+    local renderer_body
+    local install_flow_body
+
+    mkdir -p "$workspace" "$fake_home/.config/codex-desktop"
+
+    bundle_body="$(cat <<'JS'
+let n={app:{whenReady(){},quit(){},requestSingleInstanceLock(){},on(){},off(){}}};
+let Qt=`openai-bundled`,$t=`browser-use`,en=`chrome-internal`,tn=`computer-use`,nn=`latex-tectonic`;
+var $n=[{name:tn,isEnabled:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:wn}];
+function me(e,{env:t=process.env,platform:n=process.platform}={}){return n!==`win32`||t.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE!==`1`?e:{...e,computerUse:!0,computerUseNodeRepl:!0}}
+JS
+)"
+    renderer_body="$(cat <<'JS'
+function hae(e){return e===`macOS`||e===`windows`}
+function RS(e){let t=(0,q.c)(8),{enabled:n,hostId:r,isHostLocal:i}=e,a=n===void 0?!0:n,o=r===void 0?R:r,s=Kn(),{isLoading:c,platform:l}=Hr(),u=Vn(`1506311413`),d;t[0]===o?d=t[1]:(d={featureName:`computer_use`,hostId:o},t[0]=o,t[1]=d);let f=LS(d),p;t[2]===l?p=t[3]:(p=hae(l),t[2]=l,t[3]=p);let m=a&&i&&s===`electron`&&u&&(c||p),h=m&&!c&&f.enabled&&!f.isLoading,g=m&&f.isLoading,_=m&&(c||f.isLoading),v;return v}
+JS
+)"
+    install_flow_body='function Qe({forceReloadPlugins:e,hostId:t}){let ne=f({featureName:`computer_use`,hostId:t}),re=!ne.isLoading&&ne.enabled,[L,R]=(0,Z.useState)({});return re}'
+
+    make_fake_extracted_asar "$extracted" "$bundle_body"
+    printf '%s\n' "$renderer_body" > "$renderer_asset"
+    printf '%s\n' "$install_flow_body" > "$install_flow_asset"
+
+    # Branch 1: no env var, no settings.json — only the plugin manifest gate runs.
+    HOME="$fake_home" XDG_CONFIG_HOME= unset_env_value="" \
+        env -u CODEX_LINUX_ENABLE_COMPUTER_USE_UI HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+        node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
+    assert_contains "$main_bundle" '(t===`darwin`||t===`linux`)&&e.computerUse'
+    assert_not_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
+    assert_not_contains "$renderer_asset" 'function hae(e){return e===`macOS`||e===`windows`||e===`linux`}'
+    assert_not_contains "$install_flow_asset" 'navigator.userAgent.includes(`Linux`)'
+
+    # Branch 2: env var opts in — all four patches apply.
+    rm "$main_bundle" "$renderer_asset" "$install_flow_asset"
+    printf '%s\n' "$bundle_body" > "$main_bundle"
+    printf '%s\n' "$renderer_body" > "$renderer_asset"
+    printf '%s\n' "$install_flow_body" > "$install_flow_asset"
+
+    env CODEX_LINUX_ENABLE_COMPUTER_USE_UI=1 HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+        node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
+    assert_contains "$main_bundle" '(t===`darwin`||t===`linux`)&&e.computerUse'
+    assert_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
+    assert_contains "$renderer_asset" 'function hae(e){return e===`macOS`||e===`windows`||e===`linux`}'
+    assert_contains "$install_flow_asset" 'navigator.userAgent.includes(`Linux`)'
+
+    # Branch 3: settings.json flag opts in even without env var.
+    rm "$main_bundle" "$renderer_asset" "$install_flow_asset"
+    printf '%s\n' "$bundle_body" > "$main_bundle"
+    printf '%s\n' "$renderer_body" > "$renderer_asset"
+    printf '%s\n' "$install_flow_body" > "$install_flow_asset"
+    printf '%s\n' '{"codex-linux-computer-use-ui-enabled": true}' > "$fake_home/.config/codex-desktop/settings.json"
+
+    env -u CODEX_LINUX_ENABLE_COMPUTER_USE_UI HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+        node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
+    assert_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
+    assert_contains "$renderer_asset" 'function hae(e){return e===`macOS`||e===`windows`||e===`linux`}'
+    assert_contains "$install_flow_asset" 'navigator.userAgent.includes(`Linux`)'
 }
 
 test_linux_file_manager_patch_fails_soft() {
@@ -1238,12 +1733,17 @@ test_linux_file_manager_patch_fails_soft() {
 main() {
     test_common_helper_sourcing
     test_deb_builder_smoke
+    test_deb_builder_respects_package_identity
     test_rpm_builder_smoke
     test_missing_input_failure
     test_make_build_app_uses_installer_download_flow_by_default
+    test_upstream_build_app_workflow_tracks_dmg_metadata
     test_installer_detects_electron_version_from_plist
     test_installer_keeps_electron_fallback_for_bad_metadata
+    test_managed_node_runtime_source_install
+    test_browser_use_node_repl_fallback_runtime
     test_launcher_template_sanity
+    test_side_by_side_launcher_identity
     test_linux_file_manager_patch_smoke
     test_linux_translucent_sidebar_default_patch_smoke
     test_keybinds_settings_tab_patch_smoke
@@ -1251,6 +1751,8 @@ main() {
     test_linux_tray_patch_smoke
     test_browser_annotation_screenshot_patch_smoke
     test_linux_single_instance_patch_smoke
+    test_linux_computer_use_gate_patch_smoke
+    test_linux_computer_use_ui_opt_in_smoke
     test_linux_file_manager_patch_fails_soft
     info "All script smoke tests passed"
 }
